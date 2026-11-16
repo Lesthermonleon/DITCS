@@ -126,10 +126,97 @@ class AuthenticatedSessionController extends Controller
             return redirect()->route('otp.verify');
         }
 
-        // ── Future: non-OTP policy paths would go here ────────────────────
-        // (No trusted-device or skip-OTP policy is implemented at this stage)
+        // Non-OTP path: intended for temporary local testing only.
+// Production should continue using OTP_LOGIN_POLICY=every_login.
+if (config('otp.policy') === 'disabled') {
+    // Ensure this session is not carrying an old pending OTP state.
+    $request->session()->forget('otp_pending_user_id');
 
-        return redirect()->route('dashboard');
+    // Complete the login without OTP.
+    Auth::login($user);
+
+    // Prevent session fixation.
+    $request->session()->regenerate();
+    $newSessionId = $request->session()->getId();
+
+    $hadPreviousSession = false;
+
+    // Register this as the user's active session.
+    DB::transaction(function () use ($user, $newSessionId, &$hadPreviousSession) {
+        $lockedUser = User::where('id', $user->id)
+            ->lockForUpdate()
+            ->first();
+
+        if ($lockedUser) {
+            if (
+                ! empty($lockedUser->active_session_id) &&
+                $lockedUser->active_session_id !== $newSessionId
+            ) {
+                $hadPreviousSession = true;
+            }
+
+            $lockedUser->setActiveSession($newSessionId);
+        }
+    });
+
+    // Preserve the existing single-session replacement behavior.
+    if ($hadPreviousSession) {
+        try {
+            broadcast(new SessionReplaced($user->id))->toOthers();
+        } catch (\Throwable $e) {
+            logger()->warning(
+                'Failed to broadcast SessionReplaced during non-OTP login: ' .
+                $e->getMessage()
+            );
+        }
+
+        ActivityLog::create([
+            'user_id'     => $user->id,
+            'action'      => 'Session Replaced',
+            'module'      => 'Authentication',
+            'severity'    => ActivityLog::SEVERITY_WARNING,
+            'result'      => ActivityLog::RESULT_SUCCESS,
+            'description' => "Account {$user->email} replaced a previous active session.",
+            'ip_address'  => $request->ip(),
+            'logged_at'   => now(),
+        ]);
+    }
+
+    // Record the successful login.
+    ActivityLog::create([
+        'user_id'     => $user->id,
+        'action'      => 'Login',
+        'module'      => 'Authentication',
+        'severity'    => ActivityLog::SEVERITY_INFO,
+        'result'      => ActivityLog::RESULT_SUCCESS,
+        'description' => "User [{$user->email}] logged in successfully (OTP disabled for local testing).",
+        'ip_address'  => $request->ip(),
+        'logged_at'   => now(),
+    ]);
+
+    // Preserve the existing login-token behavior.
+    $plainToken = Str::random(64);
+    $encryptedToken = encrypt($plainToken);
+    $user->update(['login_token' => $encryptedToken]);
+
+    // Clear previous failed password attempts.
+    $user->resetLoginAttempts();
+
+    // Redirect according to the user's assigned role.
+    $role = $user->roles()->first();
+    $dashboardRoute = $role?->dashboard_route;
+
+    if ($dashboardRoute && Route::has($dashboardRoute)) {
+        return redirect()->route($dashboardRoute);
+    }
+
+    return redirect()->route('dashboard');
+}
+
+// Unknown policies should fail closed rather than silently bypass OTP.
+return back()->withErrors([
+    'email' => 'The login verification policy is not configured correctly.',
+])->onlyInput('email');
     }
 
     /**
